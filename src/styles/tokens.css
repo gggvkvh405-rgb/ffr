@@ -1,0 +1,89 @@
+:root {
+  --font-sans: 'Inter Variable', 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-serif: 'Cormorant Garamond', 'Times New Roman', serif;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+
+  --canvas: #07080a;
+  --surface: #0d0f11;
+  --surface-2: #111316;
+  --surface-3: #15181b;
+  --text: #f2efe8;
+  --text-2: #b8bcc0;
+  --text-3: #969ba1;
+  --text-4: #7b8188;
+  --text-5: #666c73;
+  --line: rgba(255, 255, 255, 0.065);
+  --line-strong: rgba(255, 255, 255, 0.11);
+  --line-bright: rgba(255, 255, 255, 0.17);
+
+  --accent: #d9f27c;
+  --accent-ink: #0a0c08;
+
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 11px;
+  --radius-lg: 15px;
+  --radius-xl: 20px;
+
+  --shadow-lg: 0 30px 90px -30px rgba(0, 0, 0, 0.85);
+  --shadow-pop: 0 24px 70px -18px rgba(0, 0, 0, 0.92), inset 0 1px 0 rgba(255, 255, 255, 0.055);
+
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --topbar-h: 46px;
+  --toolbar-h: 46px;
+  --status-h: 42px;
+
+  --glow-1: color-mix(in srgb, var(--accent) 11%, transparent);
+  --glow-2: rgba(96, 122, 255, 0.065);
+  --glow-3: rgba(255, 167, 112, 0.055);
+
+  color-scheme: dark;
+}
+
+html[data-accent='lime'] {
+  --accent: #d9f27c;
+}
+html[data-accent='ice'] {
+  --accent: #a9cdff;
+}
+html[data-accent='amber'] {
+  --accent: #f0c88c;
+}
+html[data-accent='rose'] {
+  --accent: #f2b6c4;
+}
+
+html[data-wallpaper='obsidian'] {
+  --canvas: #07080a;
+  --glow-1: color-mix(in srgb, var(--accent) 11%, transparent);
+  --glow-2: rgba(96, 122, 255, 0.065);
+  --glow-3: rgba(255, 167, 112, 0.055);
+}
+
+html[data-wallpaper='midnight'] {
+  --canvas: #05070c;
+  --glow-1: color-mix(in srgb, var(--accent) 7%, transparent);
+  --glow-2: rgba(76, 124, 255, 0.15);
+  --glow-3: rgba(22, 55, 112, 0.2);
+}
+
+html[data-wallpaper='ember'] {
+  --canvas: #0a0807;
+  --glow-1: color-mix(in srgb, var(--accent) 7%, transparent);
+  --glow-2: rgba(214, 140, 80, 0.1);
+  --glow-3: rgba(130, 62, 40, 0.08);
+}
+
+html[data-wallpaper='graphite'] {
+  --canvas: #08090a;
+  --glow-1: color-mix(in srgb, var(--accent) 5%, transparent);
+  --glow-2: rgba(255, 255, 255, 0.05);
+  --glow-3: rgba(255, 255, 255, 0.025);
+}
+
+html[data-grain='on'] {
+  --grain-opacity: 0.075;
+}
+html[data-grain='off'] {
+  --grain-opacity: 0;
+}
