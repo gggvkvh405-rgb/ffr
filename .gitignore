@@ -1,8 +1,11 @@
 node_modules/
 dist/
 dist-ssr/
+dist-desktop/
+build/
 *.local
 .DS_Store
 .vite/
 *.log
 *.tsbuildinfo
+native/tests/http_test

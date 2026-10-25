@@ -1,3 +1,4 @@
+import { isDesktopShell } from './platform';
 import type { InternalPage } from './types';
 
 const PROTOCOL = 'byazen://';
@@ -120,6 +121,12 @@ export function withoutProtocol(url: string): string {
 
 export function openExternal(url: string): boolean {
   try {
+    if (isDesktopShell) {
+      // Native shell: GET /open?url=... lets the shell hand the link to the
+      // system default browser instead of spawning an embedded window.
+      void fetch(`/open?url=${encodeURIComponent(url)}`, { keepalive: true }).catch(() => {});
+      return true;
+    }
     const win = window.open(url, '_blank');
     if (win) {
       // Break the opener reference immediately: no `window.opener` for the new page.
