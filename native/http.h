@@ -35,6 +35,9 @@ void byazen_conn_close(uintptr_t conn);
  * success. */
 int byazen_open_external(const char *url);
 
+/* Called when the UI has mounted inside the shell (GET /ready). */
+void byazen_page_ready(void);
+
 /* Reads one request from `conn`, writes the response and closes `conn`. */
 void byazen_http_serve(uintptr_t conn);
 

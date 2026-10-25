@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { useBrowser } from './state/browser-store';
 import { buildInternal, isWebUrl } from './lib/url';
+import { isDesktopShell } from './lib/platform';
 import { TabStrip } from './components/TabStrip';
 import { Toolbar } from './components/Toolbar';
 import { StatusBar } from './components/StatusBar';
@@ -173,6 +174,13 @@ function Shell() {
         ? 'ByAzen — тихий браузер'
         : `${activeEntry.title} — ByAzen`;
   }, [activeEntry.title]);
+
+  // Tell the native shell that the interface is alive: it uses this to decide
+  // between the embedded engine and the browser-window fallback.
+  useEffect(() => {
+    if (!isDesktopShell) return;
+    void fetch('/ready', { keepalive: true }).catch(() => {});
+  }, []);
 
   return (
     <div className={`app ${hasToolbar ? 'app--chrome' : ''}`}>

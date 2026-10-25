@@ -178,6 +178,9 @@ void byazen_http_serve(uintptr_t conn) {
     }
   } else if (strcmp(path, "/favicon.svg") == 0) {
     respond_resource(conn, BYAZEN_RES_FAVICON, "image/svg+xml");
+  } else if (strcmp(path, "/ready") == 0) {
+    byazen_page_ready();
+    respond_text(conn, "200 OK", "ok");
   } else if (strcmp(path, "/open") == 0) {
     handle_open(conn, query);
   } else if (strcmp(path, "/health") == 0) {

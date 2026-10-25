@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,7 +42,8 @@
 #define RES_HTML 101
 #define RES_FAVICON 102
 #define RES_LOADER 103
-#define BYAZEN_WATCHDOG 1
+#define BYAZEN_TIMER 1
+#define BYAZEN_ADVANCE (WM_APP + 1)
 #define BASE_PORT 47821
 #define PORT_ATTEMPTS 12
 
@@ -57,6 +59,118 @@ static int g_port;
 static void *g_env;        /* ICoreWebView2Environment*   */
 static void *g_controller; /* ICoreWebView2Controller*    */
 static void *g_webview;    /* ICoreWebView2*              */
+
+/* Start-up ladder: 0 = WebView2, 1 = WebView2 without GPU, 2 = browser window. */
+static int g_stage;
+static ULONGLONG g_stage_started;
+static int g_timer_running;
+static volatile LONG g_page_ready;
+static int g_software = 1; /* software rendering unless --gpu is passed */
+static int g_browser_only; /* --browser: skip WebView2 entirely */
+static int g_overlay_visible = 1;
+static WCHAR g_overlay[640];
+
+/* ------------------------------------------------------------------------- */
+/* Diagnostics                                                               */
+/* ------------------------------------------------------------------------- */
+
+static WCHAR g_log_path[MAX_PATH * 2];
+static int g_log_enabled;
+
+static void logf(const char *format, ...) {
+  if (!g_log_enabled) return;
+
+  char message[2048];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(message, sizeof(message), format, args);
+  va_end(args);
+
+  SYSTEMTIME now;
+  GetLocalTime(&now);
+  char line[2200];
+  int written = _snprintf(line, sizeof(line) - 1, "[%02u:%02u:%02u.%03u] %s\r\n",
+                          (unsigned)now.wHour, (unsigned)now.wMinute, (unsigned)now.wSecond,
+                          (unsigned)now.wMilliseconds, message);
+  if (written <= 0) return;
+
+  FILE *file = _wfopen(g_log_path, L"ab");
+  if (!file) return;
+  fwrite(line, 1, (size_t)written, file);
+  fclose(file);
+}
+
+static int registry_has_runtime(void) {
+  static const WCHAR *keys[] = {
+      L"SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\"
+      L"{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+      L"SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\"
+      L"{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+  };
+  for (int i = 0; i < 2; i++) {
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keys[i], 0, KEY_READ, &key) == ERROR_SUCCESS) {
+      RegCloseKey(key);
+      return 1;
+    }
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, keys[i], 0, KEY_READ, &key) == ERROR_SUCCESS) {
+      RegCloseKey(key);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void log_init(const WCHAR *exe_path) {
+  WCHAR base[MAX_PATH * 2];
+  DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH * 2);
+  if (got == 0 || got >= MAX_PATH * 2) {
+    if (GetTempPathW(MAX_PATH * 2, base) == 0) return;
+  }
+
+  WCHAR dir[MAX_PATH * 2];
+  _snwprintf(dir, MAX_PATH * 2 - 1, L"%s\\ByAzen", base);
+  dir[MAX_PATH * 2 - 1] = L'\0';
+  SHCreateDirectoryExW(NULL, dir, NULL);
+
+  _snwprintf(g_log_path, MAX_PATH * 2 - 1, L"%s\\byazen.log", dir);
+  g_log_path[MAX_PATH * 2 - 1] = L'\0';
+
+  FILE *file = _wfopen(g_log_path, L"wb");
+  if (file) fclose(file);
+  if (!file) return;
+  g_log_enabled = 1;
+
+  logf("ByAzen shell 1.1.0");
+  logf("exe: %ls", exe_path ? exe_path : L"?");
+  logf("log: %ls", g_log_path);
+
+  OSVERSIONINFOW version;
+  memset(&version, 0, sizeof(version));
+  version.dwOSVersionInfoSize = sizeof(version);
+  if (GetVersionExW(&version)) {
+    logf("windows: %lu.%lu build %lu", version.dwMajorVersion, version.dwMinorVersion,
+         version.dwBuildNumber);
+  }
+  logf("webview2 runtime in registry: %d", registry_has_runtime());
+  logf("software rendering: %d, browser only: %d", g_software, g_browser_only);
+}
+
+static void parse_command_line(void) {
+  int argc = 0;
+  LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  if (!argv) return;
+  for (int i = 1; i < argc; i++) {
+    if (!_wcsicmp(argv[i], L"--gpu")) {
+      g_software = 0;
+    } else if (!_wcsicmp(argv[i], L"--software")) {
+      g_software = 1;
+    } else if (!_wcsicmp(argv[i], L"--browser")) {
+      g_browser_only = 1;
+    }
+  }
+  LocalFree(argv);
+}
 
 /* ------------------------------------------------------------------------- */
 /* Minimal WebView2 ABI                                                      */
@@ -205,6 +319,10 @@ int byazen_open_external(const char *url) {
   return (INT_PTR)opened > 32;
 }
 
+void byazen_page_ready(void) {
+  if (InterlockedExchange(&g_page_ready, 1) == 0) logf("http: the page reported ready");
+}
+
 static DWORD WINAPI client_thread(LPVOID param) {
   byazen_http_serve((uintptr_t)param);
   return 0;
@@ -307,13 +425,18 @@ static BOOL try_dll(const WCHAR *dir, const WCHAR *name, PFN_CreateEnvWithOption
   /* Runtime DLLs resolve sibling files (and the VC runtime) by name. */
   SetDllDirectoryW(dir);
   HMODULE module = LoadLibraryW(path);
-  if (!module) return FALSE;
+  if (!module) {
+    logf("loader: %ls -> LoadLibrary failed (%lu)", path, GetLastError());
+    return FALSE;
+  }
 
   FARPROC proc = GetProcAddress(module, "CreateCoreWebView2EnvironmentWithOptions");
   if (!proc) {
+    logf("loader: %ls -> no export", path);
     FreeLibrary(module);
     return FALSE;
   }
+  logf("loader: %ls -> ok", path);
   *out = (PFN_CreateEnvWithOptions)proc;
   return TRUE;
 }
@@ -516,38 +639,124 @@ static void set_webview_background(ICoreWebView2Controller *controller, unsigned
   ((ULONG(STDMETHODCALLTYPE *)(void *))vtbl[2])(controller2);
 }
 
+/* Event handlers: shared shape (IUnknown + Invoke). */
+typedef struct EventHandler {
+  void *lpVtbl;
+  LONG ref;
+} EventHandler;
+
+static ULONG STDMETHODCALLTYPE event_add_ref(void *self) {
+  return (ULONG)InterlockedIncrement(&((EventHandler *)self)->ref);
+}
+
+static ULONG STDMETHODCALLTYPE event_release(void *self) {
+  return (ULONG)InterlockedDecrement(&((EventHandler *)self)->ref);
+}
+
+static HRESULT STDMETHODCALLTYPE event_query_interface(void *self, const GUID *riid, void **ppv) {
+  (void)riid;
+  if (!ppv) return E_POINTER;
+  *ppv = self;
+  event_add_ref(self);
+  return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE on_navigation_completed(void *self, void *sender, void *args) {
+  (void)self;
+  (void)sender;
+  BOOL success = FALSE;
+  int status = -1;
+  if (args) {
+    void **vtbl = *(void ***)args;
+    if (vtbl[3]) ((HRESULT(STDMETHODCALLTYPE *)(void *, BOOL *))vtbl[3])(args, &success);
+    if (vtbl[4]) ((HRESULT(STDMETHODCALLTYPE *)(void *, int *))vtbl[4])(args, &status);
+  }
+  logf("navigation completed: success=%d web_error_status=%d", success, status);
+  return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE on_process_failed(void *self, void *sender, void *args) {
+  (void)self;
+  (void)sender;
+  int kind = -1;
+  if (args) {
+    void **vtbl = *(void ***)args;
+    if (vtbl[3]) ((HRESULT(STDMETHODCALLTYPE *)(void *, int *))vtbl[3])(args, &kind);
+  }
+  logf("webview2 process failed: kind=%d", kind);
+  return S_OK;
+}
+
+typedef struct EventVtbl {
+  HRESULT(STDMETHODCALLTYPE *QueryInterface)(void *, const GUID *, void **);
+  ULONG(STDMETHODCALLTYPE *AddRef)(void *);
+  ULONG(STDMETHODCALLTYPE *Release)(void *);
+  HRESULT(STDMETHODCALLTYPE *Invoke)(void *, void *, void *);
+} EventVtbl;
+
+static EventVtbl g_nav_vtbl = {event_query_interface, event_add_ref, event_release,
+                               on_navigation_completed};
+static EventVtbl g_proc_vtbl = {event_query_interface, event_add_ref, event_release,
+                                on_process_failed};
+
+static EventHandler g_nav_handler;
+static EventHandler g_proc_handler;
+
+static void subscribe_events(void) {
+  void **vtbl = *(void ***)g_webview;
+  INT64 token = 0;
+
+  if (vtbl[15]) {
+    HRESULT hr = ((HRESULT(STDMETHODCALLTYPE *)(void *, void *, INT64 *))vtbl[15])(
+        g_webview, &g_nav_handler, &token);
+    logf("add_NavigationCompleted -> 0x%08lx", (unsigned long)hr);
+  }
+  if (vtbl[25]) {
+    HRESULT hr = ((HRESULT(STDMETHODCALLTYPE *)(void *, void *, INT64 *))vtbl[25])(
+        g_webview, &g_proc_handler, &token);
+    logf("add_ProcessFailed -> 0x%08lx", (unsigned long)hr);
+  }
+}
+
 static void navigate_home(void) {
   if (!g_webview) return;
   ICoreWebView2 *webview = (ICoreWebView2 *)g_webview;
-  WCHAR url[128];
-  _snwprintf(url, 127, L"http://127.0.0.1:%d/?desktop=1", g_port);
-  url[127] = L'\0';
+  WCHAR url[160];
+  _snwprintf(url, 159, L"http://127.0.0.1:%d/?desktop=1", g_port);
+  url[159] = L'\0';
+  logf("navigate: %ls", url);
   webview->lpVtbl->Navigate(webview, url);
 }
 
 static HRESULT STDMETHODCALLTYPE ctrl_invoke(Handler *self, HRESULT result,
                                              ICoreWebView2Controller *controller) {
   (void)self;
+  logf("controller callback: hresult=0x%08lx controller=%p", (unsigned long)result,
+       (void *)controller);
   if (FAILED(result) || !controller) {
-    show_error(L"Не удалось создать окно браузера.\n\n"
-               L"Обновите Microsoft Edge WebView2 Runtime и запустите ByAzen снова.");
-    PostQuitMessage(1);
+    /* Move to the next rung right away instead of waiting for the timer. */
+    if (g_hwnd) PostMessageW(g_hwnd, BYAZEN_ADVANCE, 0, 0);
     return S_OK;
   }
 
   g_controller = controller;
   /* The loader has done its job; drop the extra DLL search directory. */
   reset_dll_directory();
-  if (g_hwnd) KillTimer(g_hwnd, BYAZEN_WATCHDOG);
   /* #07080a, the app's canvas colour. */
   set_webview_background(controller, 0x0A0807FFu);
   if (controller->lpVtbl->put_IsVisible) controller->lpVtbl->put_IsVisible(controller, TRUE);
   resize_webview();
 
   ICoreWebView2 *webview = NULL;
-  if (controller->lpVtbl->get_CoreWebView2 &&
-      SUCCEEDED(controller->lpVtbl->get_CoreWebView2(controller, &webview)) && webview) {
+  HRESULT hr = controller->lpVtbl->get_CoreWebView2(controller, &webview);
+  logf("get_CoreWebView2 -> 0x%08lx webview=%p", (unsigned long)hr, (void *)webview);
+  if (SUCCEEDED(hr) && webview) {
     g_webview = webview;
+    g_nav_handler.lpVtbl = &g_nav_vtbl;
+    g_nav_handler.ref = 1;
+    g_proc_handler.lpVtbl = &g_proc_vtbl;
+    g_proc_handler.ref = 1;
+    subscribe_events();
     navigate_home();
   }
 
@@ -558,11 +767,9 @@ static HRESULT STDMETHODCALLTYPE ctrl_invoke(Handler *self, HRESULT result,
 static HRESULT STDMETHODCALLTYPE env_invoke(Handler *self, HRESULT result,
                                             ICoreWebView2Environment *env) {
   (void)self;
+  logf("environment callback: hresult=0x%08lx env=%p", (unsigned long)result, (void *)env);
   if (FAILED(result) || !env) {
-    show_error(L"Не удалось запустить Microsoft Edge WebView2.\n\n"
-               L"Установите Microsoft Edge WebView2 Runtime с сайта Microsoft и откройте "
-               L"ByAzen снова.");
-    PostQuitMessage(1);
+    if (g_hwnd) PostMessageW(g_hwnd, BYAZEN_ADVANCE, 0, 0);
     return S_OK;
   }
 
@@ -572,20 +779,14 @@ static HRESULT STDMETHODCALLTYPE env_invoke(Handler *self, HRESULT result,
   g_ctrl_handler.kind = 1;
 
   HRESULT hr = env->lpVtbl->CreateCoreWebView2Controller(env, g_hwnd, &g_ctrl_handler);
-  if (FAILED(hr)) {
-    show_error(L"Не удалось инициализировать WebView2.");
-    PostQuitMessage(1);
-  }
+  logf("CreateCoreWebView2Controller -> 0x%08lx", (unsigned long)hr);
   return S_OK;
 }
 
 static BOOL start_webview(void) {
   PFN_CreateEnvWithOptions create_env = NULL;
   if (!resolve_webview2(&create_env)) {
-    show_error(L"Для работы ByAzen нужен Microsoft Edge WebView2 Runtime.\n\n"
-               L"Он уже входит в Windows 11 и в свежие сборки Windows 10. Если его нет — "
-               L"скачайте установщик «Evergreen Bootstrapper» на странице Microsoft Edge "
-               L"WebView2 в интернете и запустите ByAzen снова.");
+    logf("webview2: no loader could be resolved");
     return FALSE;
   }
 
@@ -597,21 +798,27 @@ static BOOL start_webview(void) {
     GetTempPathW(MAX_PATH * 2, local);
     join_path(user_data, MAX_PATH * 2, local, L"ByAzen");
   } else {
-    join_path(user_data, MAX_PATH * 2, local, L"ByAzen\\WebView2");
+    /* A fresh profile per attempt guarantees a fresh browser process, so the
+     * GPU flags of that attempt really apply. */
+    join_path(user_data, MAX_PATH * 2, local,
+              g_stage >= 1 ? L"ByAzen\\WebView2-alt" : L"ByAzen\\WebView2");
   }
   SHCreateDirectoryExW(NULL, user_data, NULL);
+
+  /* The environment reads this before the browser process starts. */
+  if (g_software) {
+    SetEnvironmentVariableW(L"WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+                            L"--disable-gpu --disable-gpu-compositing");
+  }
 
   g_env_handler.lpVtbl = &g_env_vtbl;
   g_env_handler.ref = 1;
   g_env_handler.kind = 0;
 
+  logf("webview2: creating environment (software=%d)", g_software);
   HRESULT hr = create_env(NULL, user_data, NULL, &g_env_handler);
-  if (FAILED(hr)) {
-    show_error(L"WebView2 Runtime не отвечает.\n\n"
-               L"Переустановите Microsoft Edge WebView2 Runtime и попробуйте снова.");
-    return FALSE;
-  }
-  return TRUE;
+  logf("webview2: CreateCoreWebView2EnvironmentWithOptions -> 0x%08lx", (unsigned long)hr);
+  return SUCCEEDED(hr);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -704,6 +911,177 @@ static void show_error(const WCHAR *text) {
   MessageBoxW(g_hwnd, text, BYAZEN_TITLE, MB_ICONWARNING | MB_OK | MB_SETFOREGROUND);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Start-up ladder, overlay and browser fallback                             */
+/* ------------------------------------------------------------------------- */
+
+static void set_overlay(const WCHAR *text) {
+  wcsncpy(g_overlay, text, 639);
+  g_overlay[639] = L'\0';
+  g_overlay_visible = 1;
+  if (g_hwnd) InvalidateRect(g_hwnd, NULL, TRUE);
+}
+
+static void paint_overlay(HDC dc, const RECT *rc) {
+  int width = rc->right - rc->left;
+  int height = rc->bottom - rc->top;
+
+  HFONT title_font = CreateFontW(-30, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                 DEFAULT_PITCH, L"Segoe UI");
+  HFONT body_font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                DEFAULT_PITCH, L"Segoe UI");
+
+  SetBkMode(dc, TRANSPARENT);
+
+  RECT title_rc = *rc;
+  title_rc.top = height / 2 - 110;
+  title_rc.bottom = title_rc.top + 44;
+  HGDIOBJ previous = SelectObject(dc, title_font);
+  SetTextColor(dc, RGB(242, 239, 232));
+  DrawTextW(dc, L"ByAzen", -1, &title_rc, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+  RECT body_rc = *rc;
+  int inset = width / 4;
+  if (inset < 70) inset = 70;
+  body_rc.left += inset;
+  body_rc.right -= inset;
+  body_rc.top = title_rc.bottom + 16;
+  if (body_rc.bottom - body_rc.top < 120) body_rc.bottom = body_rc.top + 120;
+
+  SelectObject(dc, body_font);
+  SetTextColor(dc, RGB(150, 155, 161));
+  DrawTextW(dc, g_overlay, -1, &body_rc, DT_CENTER | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+
+  SelectObject(dc, previous);
+  DeleteObject(title_font);
+  DeleteObject(body_font);
+}
+
+static void close_controller(void) {
+  ICoreWebView2Controller *controller = (ICoreWebView2Controller *)g_controller;
+  if (controller && controller->lpVtbl && controller->lpVtbl->Close)
+    controller->lpVtbl->Close(controller);
+  g_controller = NULL;
+  g_webview = NULL;
+  g_env = NULL;
+}
+
+static BOOL open_edge_app(const WCHAR *url) {
+  static const WCHAR *patterns[] = {
+      L"%ProgramFiles(x86)%\\Microsoft\\Edge\\Application\\msedge.exe",
+      L"%ProgramFiles%\\Microsoft\\Edge\\Application\\msedge.exe",
+      L"%LOCALAPPDATA%\\Microsoft\\Edge\\Application\\msedge.exe",
+  };
+  WCHAR exe[MAX_PATH * 2];
+  WCHAR arguments[MAX_PATH * 2];
+
+  for (int i = 0; i < 3; i++) {
+    DWORD len = ExpandEnvironmentStringsW(patterns[i], exe, MAX_PATH * 2);
+    if (len == 0 || len >= MAX_PATH * 2) continue;
+    if (!file_exists(exe)) continue;
+
+    _snwprintf(arguments, MAX_PATH * 2 - 1, L"--app=\"%s\" --window-size=1440,900", url);
+    arguments[MAX_PATH * 2 - 1] = L'\0';
+    HINSTANCE result = ShellExecuteW(NULL, L"open", exe, arguments, NULL, SW_SHOWNORMAL);
+    logf("edge app: %ls -> %ld", exe, (long)(INT_PTR)result);
+    if ((INT_PTR)result > 32) return TRUE;
+  }
+  return FALSE;
+}
+
+static void fallback_to_browser(void) {
+  g_stage = 2;
+  if (g_timer_running) {
+    KillTimer(g_hwnd, BYAZEN_TIMER);
+    g_timer_running = 0;
+  }
+  close_controller();
+
+  WCHAR url[200];
+  _snwprintf(url, 199, L"http://127.0.0.1:%d/?desktop=1", g_port);
+  url[199] = L'\0';
+
+  BOOL opened = open_edge_app(url);
+  if (!opened) {
+    opened = (INT_PTR)ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL) > 32;
+  }
+  logf("fallback: browser window opened=%d url=%ls", opened, url);
+
+  if (!opened) {
+    set_overlay(L"Не удалось открыть ни WebView2, ни браузер.\n\n"
+                L"Пришлите, пожалуйста, файл лога:\n"
+                L"%LOCALAPPDATA%\\ByAzen\\byazen.log");
+    show_error(L"ByAzen не смог запустить встроенный движок и не нашёл браузер.\n\n"
+               L"Лог для диагностики: %LOCALAPPDATA%\\ByAzen\\byazen.log");
+    return;
+  }
+
+  set_overlay(L"Встроенный движок WebView2 на этой системе не отвечает,\n"
+              L"поэтому ByAzen открыт в отдельном окне браузера.\n\n"
+              L"Это окно держит соединение с интерфейсом — закройте его,\n"
+              L"когда закончите работу.\n\n"
+              L"Подробности запуска: %LOCALAPPDATA%\\ByAzen\\byazen.log");
+}
+
+static void retry_alternative(void) {
+  close_controller();
+  g_software = g_software ? 0 : 1;
+  g_stage = 1;
+  g_stage_started = GetTickCount64();
+  set_overlay(L"Движок не ответил — пробую другой режим отрисовки…\n\n"
+              L"Если окно так и останется чёрным, нажмите Ctrl+Alt+R\n"
+              L"или запустите ByAzen.exe с параметром --browser.");
+  logf("ladder: retrying with software=%d", g_software);
+  if (!start_webview()) fallback_to_browser();
+}
+
+static void manual_retry(void) {
+  logf("hotkey: manual engine retry");
+  close_controller();
+  g_software = g_software ? 0 : 1;
+  g_stage = 0;
+  g_stage_started = GetTickCount64();
+  InterlockedExchange(&g_page_ready, 0);
+  set_overlay(L"Перезапускаю движок…");
+  if (!start_webview()) {
+    fallback_to_browser();
+    return;
+  }
+  if (!g_timer_running) {
+    SetTimer(g_hwnd, BYAZEN_TIMER, 500, NULL);
+    g_timer_running = 1;
+  }
+}
+
+static void ladder_tick(void) {
+  if (InterlockedCompareExchange(&g_page_ready, 1, 1) == 1) {
+    logf("page reports ready");
+    if (g_overlay_visible) {
+      g_overlay_visible = 0;
+      InvalidateRect(g_hwnd, NULL, TRUE);
+    }
+    if (g_timer_running) {
+      KillTimer(g_hwnd, BYAZEN_TIMER);
+      g_timer_running = 0;
+    }
+    return;
+  }
+
+  if (g_stage >= 2) return;
+
+  ULONGLONG elapsed = GetTickCount64() - g_stage_started;
+  if (g_stage == 0 && elapsed >= 9000) {
+    logf("ladder: no page after %llu ms (controller=%d)", (unsigned long long)elapsed,
+         g_controller != NULL ? 1 : 0);
+    retry_alternative();
+  } else if (g_stage == 1 && elapsed >= 12000) {
+    logf("ladder: software rendering did not help after %llu ms", (unsigned long long)elapsed);
+    fallback_to_browser();
+  }
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
   switch (msg) {
     case WM_SIZE:
@@ -716,14 +1094,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
       return 0;
     }
     case WM_TIMER:
-      if (wparam == BYAZEN_WATCHDOG) {
-        KillTimer(hwnd, BYAZEN_WATCHDOG);
-        if (!g_controller) {
-          show_error(L"WebView2 не запустился за 20 секунд.\n\n"
-                     L"Проверьте Microsoft Edge WebView2 Runtime: возможно, он повреждён или "
-                     L"заблокирован политикой безопасности.");
-          PostQuitMessage(1);
-        }
+      if (wparam == BYAZEN_TIMER) {
+        ladder_tick();
         return 0;
       }
       return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -733,7 +1105,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
     case WM_SETFOCUS:
       focus_webview();
       return 0;
+    case BYAZEN_ADVANCE:
+      if (g_stage == 0) {
+        retry_alternative();
+      } else if (g_stage == 1) {
+        fallback_to_browser();
+      }
+      return 0;
+    case WM_HOTKEY:
+      if (wparam == 1) {
+        manual_retry();
+        return 0;
+      }
+      return DefWindowProcW(hwnd, msg, wparam, lparam);
+    case WM_PAINT: {
+      PAINTSTRUCT paint;
+      HDC dc = BeginPaint(hwnd, &paint);
+      if (g_overlay_visible) {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, g_bg_brush);
+        paint_overlay(dc, &rc);
+      }
+      EndPaint(hwnd, &paint);
+      return 0;
+    }
     case WM_ERASEBKGND: {
+      if (!g_overlay_visible) return 1;
       RECT rc;
       GetClientRect(hwnd, &rc);
       FillRect((HDC)wparam, &rc, g_bg_brush);
@@ -744,6 +1142,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
       DestroyWindow(hwnd);
       return 0;
     case WM_DESTROY: {
+      UnregisterHotKey(hwnd, 1);
       ICoreWebView2Controller *controller = (ICoreWebView2Controller *)g_controller;
       if (controller && controller->lpVtbl && controller->lpVtbl->Close)
         controller->lpVtbl->Close(controller);
@@ -797,10 +1196,19 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line, i
     }
   }
 
+  parse_command_line();
+  {
+    WCHAR exe_path[MAX_PATH * 2];
+    DWORD len = GetModuleFileNameW(NULL, exe_path, MAX_PATH * 2);
+    if (len == 0 || len >= MAX_PATH * 2) exe_path[0] = L'\0';
+    log_init(exe_path);
+  }
+
   enable_dpi_awareness();
   CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
   g_port = start_server();
+  logf("server: port %d", g_port);
   if (g_port <= 0) {
     MessageBoxW(NULL, L"Не удалось запустить локальный сервер ByAzen.", BYAZEN_TITLE,
                 MB_ICONERROR | MB_OK);
@@ -866,14 +1274,24 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line, i
   }
 
   apply_dark_frame(g_hwnd);
+  RegisterHotKey(g_hwnd, 1, MOD_CONTROL | MOD_ALT, 'R');
+  set_overlay(L"Запускаем ByAzen…");
   ShowWindow(g_hwnd, maximized ? SW_SHOWMAXIMIZED : SW_SHOW);
   UpdateWindow(g_hwnd);
 
-  if (!start_webview()) {
-    DestroyWindow(g_hwnd);
-    return 1;
+  g_stage = 0;
+  g_stage_started = GetTickCount64();
+  if (g_browser_only) {
+    logf("start: --browser, skipping WebView2");
+    fallback_to_browser();
+  } else if (!start_webview()) {
+    logf("start: webview2 could not be started");
+    fallback_to_browser();
   }
-  SetTimer(g_hwnd, BYAZEN_WATCHDOG, 20000, NULL);
+  if (g_stage < 2) {
+    SetTimer(g_hwnd, BYAZEN_TIMER, 500, NULL);
+    g_timer_running = 1;
+  }
 
   MSG msg;
   while (GetMessageW(&msg, NULL, 0, 0) > 0) {

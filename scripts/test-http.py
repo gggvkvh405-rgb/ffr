@@ -54,7 +54,8 @@ def wait_ready(process: subprocess.Popen[str], timeout: float = 10.0) -> bool:
     return False
 
 
-def drain_open_calls(process: subprocess.Popen[str], count: int, timeout: float = 5.0) -> list[str]:
+def drain_lines(process: subprocess.Popen[str], count: int, timeout: float = 5.0) -> list[str]:
+    """Reads non-empty lines the harness prints (OPEN ... / PING)."""
     seen: list[str] = []
     deadline = time.time() + timeout
     assert process.stdout is not None
@@ -62,9 +63,16 @@ def drain_open_calls(process: subprocess.Popen[str], count: int, timeout: float 
         line = process.stdout.readline()
         if not line:
             break
-        if line.startswith("OPEN "):
-            seen.append(line[5:].strip())
+        line = line.strip()
+        if line:
+            seen.append(line)
     return seen
+
+
+def drain_open_calls(process: subprocess.Popen[str], count: int, timeout: float = 5.0) -> list[str]:
+    opened = [line[5:].strip() for line in drain_lines(process, count, timeout)
+              if line.startswith("OPEN ")]
+    return opened
 
 
 def main() -> int:
@@ -125,6 +133,10 @@ def main() -> int:
 
         status, _, body = request("GET", "/health")
         check(status == 200 and body == b"byazen", "GET /health -> byazen")
+
+        status, _, body = request("GET", "/ready")
+        check(status == 200 and body == b"ok", "GET /ready -> ok")
+        check(drain_lines(server, 1) == ["PING"], "the shell learns that the page is alive")
 
         status, _, body = request("GET", "/nope")
         check(status == 404, "unknown path -> 404")

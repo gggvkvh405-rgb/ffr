@@ -81,6 +81,11 @@ int byazen_open_external(const char *url) {
   return strstr(url, "deny") == NULL;
 }
 
+void byazen_page_ready(void) {
+  printf("PING\n");
+  fflush(stdout);
+}
+
 int main(int argc, char **argv) {
   int port = argc > 1 ? atoi(argv[1]) : 47899;
   if (!load_html()) return 2;
