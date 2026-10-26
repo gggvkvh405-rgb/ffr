@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Данные пользователя (настройки, история, кэш голоса)
+data/*
+!data/.gitkeep
+
+# ОС
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Локальные логи
+*.log
+
+# Node (только для тестов интерфейса)
+node_modules/
+package-lock.json
+
+# Сборка .exe
+dist/
+build/
+out/
+*.zip

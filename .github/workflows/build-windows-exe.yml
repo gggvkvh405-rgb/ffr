@@ -1,0 +1,194 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Создать релиз с этим тегом (необязательно, например v1.0.0)"
+        required: false
+        default: ""
+      onefile:
+        description: "Собрать одним файлом (медленнее запуск)"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - "app/**"
+      - "web/**"
+      - "run.py"
+      - "aura.spec"
+      - "requirements.txt"
+      - ".github/workflows/build-windows-exe.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  # Сначала проверяем саму упаковку: собираем бинарь на Linux и запускаем его.
+  verify-packaging:
+    name: Проверка упаковки (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+      - name: Сборка
+        env:
+          AURA_ROOT: ${{ github.workspace }}
+        run: pyinstaller aura.spec --noconfirm --clean
+      - name: Запуск собранного бинаря
+        env:
+          AURA_DATA_DIR: ${{ runner.temp }}/aura-data
+        run: |
+          ls -la dist/aura | head -20
+          ./dist/aura/aura --port 8899 --no-browser --no-tray > /tmp/aura-run.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8899/api/health > /tmp/health.json; then break; fi
+            sleep 1
+          done
+          cat /tmp/health.json || (echo "--- лог ---"; cat /tmp/aura-run.log; exit 1)
+          grep -q '"ok":true' /tmp/health.json
+          # интерфейс и статика должны отдаваться из собранного бандла
+          curl -sf http://127.0.0.1:8899/ | grep -q "Аура"
+          curl -sf http://127.0.0.1:8899/static/app.js | head -c 60
+          curl -sf http://127.0.0.1:8899/api/state | grep -q '"tools"'
+          echo "OK: собранный бинарь отдаёт интерфейс и API"
+      - name: Лог при ошибке
+        if: failure()
+        run: cat /tmp/aura-run.log || true
+
+  build:
+    name: Сборка Аура.exe
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Код
+        uses: actions/checkout@v4
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Иконка (ico уже в репозитории, пересобираем из png на всякий случай)
+        run: |
+          python -c "from PIL import Image; img = Image.open('web/icon.png').convert('RGBA'); img.resize((256,256), Image.LANCZOS).save('web/icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+
+      - name: PyInstaller
+        shell: pwsh
+        env:
+          AURA_ROOT: ${{ github.workspace }}
+          AURA_ONEFILE: ${{ inputs.onefile && '1' || '0' }}
+        run: |
+          pyinstaller aura.spec --noconfirm --clean
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller завершился с ошибкой" }
+
+      - name: Проверка сборки
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist")) { throw "Нет папки dist" }
+          Get-ChildItem dist -Recurse -Depth 2 | Select-Object -First 25 FullName, Length
+          # .exe должен существовать и содержать web-интерфейс внутри
+          if (!(Test-Path "dist/Аура/Аура.exe")) {
+            if (!(Test-Path "dist/Аура.exe")) { throw "Исполняемый файл не создан" }
+          }
+          $web = Get-ChildItem dist -Recurse -Filter "index.html" | Select-Object -First 1
+          if (!$web) { throw "Web-интерфейс не попал в сборку" }
+          Write-Host "Web найден: $($web.FullName)"
+
+      - name: Упаковка
+        id: pack
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          if (Test-Path "dist/Аура.exe") {
+            Copy-Item "dist/Аура.exe" "out/Аура.exe"
+            $name = "Aura-Assistant-Windows-x64-onefile.zip"
+          } else {
+            Copy-Item -Recurse "dist/Аура" "out/Аура"
+            New-Item -ItemType Directory -Force -Path "out/Аура/data" | Out-Null
+            Set-Content -Path "out/Аура/ЧИТАЙ-МЕНЯ.txt" -Encoding UTF8 -Value @"
+          АУРА — голосовой ИИ-ассистент
+          ================================
+
+          1. Установите Ollama: https://ollama.com/download/windows
+          2. Скачайте модель (один раз, в PowerShell):
+               ollama pull qwen2.5:7b
+          3. Запустите Аура.exe
+
+          Интерфейс откроется в браузере: http://localhost:8765
+          Иконка Ауры появится в системном трее — через неё можно открыть
+          программу, папку данных или выйти.
+
+          Настройки, история и память лежат в папке data рядом с Аура.exe.
+
+          Микрофон: разрешите браузеру доступ к нему.
+          Голосовые ответы: Настройки → Голос.
+          "@
+            $name = "Aura-Assistant-Windows-x64.zip"
+          }
+          Compress-Archive -Path "out/*" -DestinationPath $name -CompressionLevel Optimal
+          $sizeMb = [math]::Round((Get-Item $name).Length / 1MB, 1)
+          Write-Host "Архив: $name ($sizeMb МБ)"
+
+          # Проверяем, что внутри архива всё на месте и имена не побились
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $name))
+          try {
+            $entries = $zip.Entries | ForEach-Object { $_.FullName }
+            Write-Host "Записей в архиве: $($entries.Count)"
+            $entries | Select-Object -First 12 | ForEach-Object { Write-Host "  $_" }
+            if (-not ($entries -match "Аура\.exe$|^Аура\.exe$")) { throw "В архиве нет Аура.exe" }
+            if (-not ($entries -match "web[/\\]index.html$")) { throw "В архиве нет web/index.html" }
+            if (-not ($entries -match "ЧИТАЙ-МЕНЯ\.txt$")) { throw "В архиве нет инструкции" }
+            Write-Host "OK: структура архива корректна"
+          } finally {
+            $zip.Dispose()
+          }
+          "archive=$name" >> $env:GITHUB_OUTPUT
+
+      - name: Артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: aura-windows-x64
+          path: ${{ steps.pack.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Релиз
+        if: inputs.release_tag != '' || startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          name: "Аура ${{ inputs.release_tag || github.ref_name }}"
+          draft: false
+          generate_release_notes: true
+          body: |
+            **Аура** — голосовой ИИ-ассистент для Windows, работающий через Ollama.
+
+            ### Установка
+            1. Скачайте архив ниже и распакуйте в любую папку.
+            2. Установите [Ollama](https://ollama.com/download/windows) и выполните `ollama pull qwen2.5:7b`.
+            3. Запустите `Аура.exe` — интерфейс откроется в браузере, иконка появится в трее.
+
+            Нужен Windows 10/11 x64. Данные (настройки, история, память) хранятся в папке `data` рядом с `.exe`.
+          files: ${{ steps.pack.outputs.archive }}

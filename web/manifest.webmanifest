@@ -1,0 +1,21 @@
+{
+  "name": "Аура — голосовой ИИ-ассистент",
+  "short_name": "Аура",
+  "description": "Локальный голосовой ассистент на Ollama, который управляет компьютером",
+  "lang": "ru",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#06070d",
+  "theme_color": "#080910",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    {
+      "src": "/static/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
