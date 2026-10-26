@@ -4,13 +4,52 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Any
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.environ.get("AURA_DATA_DIR") or (BASE_DIR / "data"))
-WEB_DIR = BASE_DIR / "web"
+FROZEN = bool(getattr(sys, "frozen", False))
+
+
+def _resource_dir() -> Path:
+    """Где лежат web-файлы: рядом с исходниками или внутри .exe (PyInstaller)."""
+    if FROZEN:
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    return Path(__file__).resolve().parent.parent
+
+
+def _data_dir() -> Path:
+    """Пользовательские данные: рядом с .exe, а если туда нельзя писать — в профиль."""
+    override = os.environ.get("AURA_DATA_DIR")
+    if override:
+        return Path(override)
+    if not FROZEN:
+        return _resource_dir() / "data"
+
+    candidates = [Path(sys.executable).resolve().parent / "data"]
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if local:
+            candidates.append(Path(local) / "Aura" / "data")
+    else:
+        candidates.append(Path.home() / ".local" / "share" / "aura")
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return candidate
+        except Exception:  # noqa: BLE001
+            continue
+    return candidates[-1]
+
+
+BASE_DIR = Path(sys.executable).resolve().parent if FROZEN else _resource_dir()
+RESOURCE_DIR = _resource_dir()
+DATA_DIR = _data_dir()
+WEB_DIR = RESOURCE_DIR / "web"
 CONFIG_PATH = DATA_DIR / "config.json"
 
 DEFAULTS: dict[str, Any] = {

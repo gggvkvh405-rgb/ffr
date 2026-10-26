@@ -20,3 +20,9 @@ desktop.ini
 # Node (только для тестов интерфейса)
 node_modules/
 package-lock.json
+
+# Сборка .exe
+dist/
+build/
+out/
+*.zip
