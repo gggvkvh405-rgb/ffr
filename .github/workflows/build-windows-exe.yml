@@ -149,6 +149,21 @@ jobs:
           Compress-Archive -Path "out/*" -DestinationPath $name -CompressionLevel Optimal
           $sizeMb = [math]::Round((Get-Item $name).Length / 1MB, 1)
           Write-Host "Архив: $name ($sizeMb МБ)"
+
+          # Проверяем, что внутри архива всё на месте и имена не побились
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $name))
+          try {
+            $entries = $zip.Entries | ForEach-Object { $_.FullName }
+            Write-Host "Записей в архиве: $($entries.Count)"
+            $entries | Select-Object -First 12 | ForEach-Object { Write-Host "  $_" }
+            if (-not ($entries -match "Аура\.exe$|^Аура\.exe$")) { throw "В архиве нет Аура.exe" }
+            if (-not ($entries -match "web[/\\]index.html$")) { throw "В архиве нет web/index.html" }
+            if (-not ($entries -match "ЧИТАЙ-МЕНЯ\.txt$")) { throw "В архиве нет инструкции" }
+            Write-Host "OK: структура архива корректна"
+          } finally {
+            $zip.Dispose()
+          }
           "archive=$name" >> $env:GITHUB_OUTPUT
 
       - name: Артефакт

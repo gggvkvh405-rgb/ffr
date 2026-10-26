@@ -15,9 +15,10 @@
 
 ## Готовый .exe (Windows)
 
-Собранный `Аура.exe` лежит в разделе **Releases** этого репозитория:
+Готовый архив: **[Aura-Assistant-Windows-x64.zip (релиз v1.0.0)](https://github.com/gggvkvh405-rgb/ffr/releases/latest/download/Aura-Assistant-Windows-x64.zip)**
+(≈94 МБ, Windows 10/11 x64)
 
-1. Скачайте `Aura-Assistant-Windows-x64.zip` и распакуйте в любую папку.
+1. Скачайте архив и распакуйте в любую папку.
 2. Установите [Ollama для Windows](https://ollama.com/download/windows) и один раз выполните:
    ```powershell
    ollama pull qwen2.5:7b
